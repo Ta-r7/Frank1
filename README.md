@@ -19,12 +19,14 @@ These endpoints are publicly accessible, but we kindly ask you to support adsb.f
 | /v2/registration/[reg] | GET | Returns aircraft by registration |
 | /v2/sqk/[squawk] | GET | Returns aircraft by squawk |
 | /v2/mil | GET | Returns aircraft marked as military |
-| /v2/lat/[lat]/lon/[lon]/dist/[dist] | GET | Returns aircraft within specified distance up to 250 NM |
+| /v3/lat/[lat]/lon/[lon]/dist/[dist] | GET | Returns aircraft within specified distance up to 250 NM |
 
 Example usage:  
 `curl https://opendata.adsb.fi/api/v2/hex/461E1A`  
 `curl https://opendata.adsb.fi/api/v2/icao/461E1A,4ACA0B`  
-`curl https://opendata.adsb.fi/api/v2/lat/60.3179/lon/24.9496/dist/25`
+`curl https://opendata.adsb.fi/api/v3/lat/60.3179/lon/24.9496/dist/25`
+
+Note: The v2/lat/lon/dist endpoint returned data in a different format than other v2 endpoints. It remains functional for backward compatibility but is considered deprecated. The corresponding v3 endpoint should be used for all new integrations.
 
 
 ## Feeder endpoints
