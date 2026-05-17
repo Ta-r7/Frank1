@@ -45,6 +45,9 @@ Example usage:
 We use rate limiting to protect against abuse and misuse, and to help ensure everyone has fair access to the API.
 The public endpoints are rate limited to 1 request per second, and the feeder endpoint to 1 request every 30 seconds.
 
+Making excessive invalid HTTP requests results in a temporary IP address restriction. 
+Requests returning a 400, 401, 403, 404, or 429 status code count toward the limit. Users should make reasonable efforts to avoid invalid requests.
+
 
 ## Terms
 adsb.fi open data is for personal, non-commercial use only. You may not license, sell, rent, or lease any part of the data or the service. 
