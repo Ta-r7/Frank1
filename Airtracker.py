@@ -53,7 +53,13 @@ except ImportError:
 # Bevestigd via tar1090-db: 739600..739605 = 4X-IHA..4X-IHF (ATR-72-600).
 DEFAULT_HEXES = ["739600", "739601", "739602", "739603", "739604", "739605"]
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+# PyInstaller-aware: bij een .exe wijst sys.executable naar de .exe locatie,
+# bij een gewone Python-run wijst __file__ naar het script. We willen altijd
+# de map naast het draaiende ding (zodat .cache/ en air_haifa.xlsx daar komen).
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = Path(sys.executable).resolve().parent
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
 EXCEL_PATH = SCRIPT_DIR / "air_haifa.xlsx"
 CACHE_DIR = SCRIPT_DIR / ".cache"
 SETTINGS_PATH = SCRIPT_DIR / "air_haifa_settings.json"
