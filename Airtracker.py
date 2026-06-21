@@ -23,11 +23,13 @@ import csv
 import io
 import json
 import gzip
+import tarfile
 import threading
 import time
 import re
 import math
 from datetime import datetime, timedelta, timezone
+from io import RawIOBase
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -142,85 +144,115 @@ class MultiPartTarReader:
             cumulative += sz
         return bytes(result)
 
-    @staticmethod
-    def _parse_header(block):
-        if len(block) < 512 or block == b"\x00" * 512:
-            return None
-        name = block[0:100].rstrip(b"\x00").decode("utf-8", errors="replace")
-        if not name:
-            return None
-        size_field = block[124:136].rstrip(b"\x00 ").decode("ascii", errors="replace")
-        try:
-            size = int(size_field, 8) if size_field else 0
-        except ValueError:
-            size = 0
-        typeflag = block[156:157].decode("ascii", errors="replace")
-        prefix = block[345:500].rstrip(b"\x00").decode("utf-8", errors="replace")
-        if prefix:
-            name = prefix + "/" + name
-        return name, size, typeflag
+    def _open_stream(self, log_progress_every=None):
+        """Sequential read-only file-like over the (possibly split) tar."""
+        return _RangeStream(self, log_func=self.log,
+                            progress_every_mb=(log_progress_every or 0) // (1024*1024))
 
     def find_files(self, target_paths, log_progress_every=None,
-                   cancel_event=None, observed_subdirs=None):
+                   cancel_event=None, observed_subdirs=None,
+                   sample_names=None):
+        """Walk the tar with Python's tarfile module (handles pax / GNU
+        long-name extensions correctly) and return {name: data_bytes}
+        for any target_paths that show up. Optionally collects up to 30
+        encountered file paths into sample_names for diagnostic output."""
         self._resolve_sizes()
         targets = set(target_paths)
         found = {}
-        pos = 0
-        bytes_scanned = 0
-        last_log = 0
-        while pos < self.total_size and targets:
-            if cancel_event and cancel_event.is_set():
-                self.log("  scan geannuleerd")
-                break
-            to_read = min(self.SCAN_CHUNK, self.total_size - pos)
-            data = self._fetch_range(pos, to_read)
-            bytes_scanned += len(data)
-            if log_progress_every and bytes_scanned - last_log > log_progress_every:
-                pct = pos / self.total_size * 100
-                self.log(f"  scannen... {pct:.0f}% "
-                         f"({pos // (1024*1024)}/{self.total_size // (1024*1024)} MB)")
-                last_log = bytes_scanned
-            offset_in_chunk = 0
-            chunk_consumed = False
-            while offset_in_chunk + self.HEADER_SIZE <= len(data) and targets:
-                header_block = data[offset_in_chunk:offset_in_chunk + self.HEADER_SIZE]
-                parsed = self._parse_header(header_block)
-                if parsed is None:
-                    offset_in_chunk += self.HEADER_SIZE
-                    continue
-                name, size, typeflag = parsed
-                file_data_offset = pos + offset_in_chunk + self.HEADER_SIZE
-                norm_name = name[2:] if name.startswith("./") else name
+        stream = self._open_stream(log_progress_every)
+        try:
+            tf = tarfile.open(fileobj=stream, mode="r|")
+        except tarfile.TarError as e:
+            self.log(f"  ! tarfile open faalde: {e}")
+            return found
+        try:
+            for member in tf:
+                if cancel_event and cancel_event.is_set():
+                    self.log("  scan geannuleerd")
+                    break
+                name = member.name
+                if name.startswith("./"):
+                    name = name[2:]
                 if observed_subdirs is not None:
-                    m = re.match(r"traces/([0-9a-f]{2})/", norm_name)
+                    m = re.match(r"traces/([0-9a-f]{2})/", name)
                     if m:
                         observed_subdirs.add(m.group(1))
-                if norm_name in targets:
-                    found[norm_name] = (file_data_offset, size)
-                    targets.discard(norm_name)
-                    self.log(f"  + gevonden: {norm_name} ({size:,} bytes)")
-                if typeflag in ("0", "", "\x00"):
-                    data_blocks = (size + self.BLOCK_SIZE - 1) // self.BLOCK_SIZE
-                    skip = self.HEADER_SIZE + data_blocks * self.BLOCK_SIZE
-                else:
-                    skip = self.HEADER_SIZE
-                next_offset = offset_in_chunk + skip
-                if next_offset + self.HEADER_SIZE > len(data):
-                    pos = pos + offset_in_chunk + skip
-                    chunk_consumed = True
-                    break
-                else:
-                    offset_in_chunk = next_offset
-            if not chunk_consumed:
-                pos += len(data)
-            if not targets:
-                break
+                if (sample_names is not None and member.isfile()
+                        and len(sample_names) < 30):
+                    sample_names.append(name)
+                if name in targets and member.isfile():
+                    extracted = tf.extractfile(member)
+                    if extracted is None:
+                        continue
+                    data = extracted.read()
+                    found[name] = data
+                    targets.discard(name)
+                    self.log(f"  + gevonden: {name} ({len(data):,} bytes)")
+                    if not targets:
+                        break
+        except tarfile.TarError as e:
+            self.log(f"  ! tarfile fout tijdens scan: {e}")
+        except Exception as e:
+            self.log(f"  ! onverwachte fout tijdens scan: {e}")
+        finally:
+            try:
+                tf.close()
+            except Exception:
+                pass
         return found
 
-    def fetch_file(self, offset, size):
-        if size == 0:
-            return b""
-        return self._fetch_range(offset, size)
+
+class _RangeStream(RawIOBase):
+    """File-like wrapper that turns a MultiPartTarReader into a forward-only
+    byte stream for tarfile. Buffers in 8 MB blocks and logs progress."""
+
+    FETCH_CHUNK = 8 * 1024 * 1024
+
+    def __init__(self, reader, log_func=None, progress_every_mb=100):
+        self.reader = reader
+        self.pos = 0
+        self.total = reader.total_size
+        self.log = log_func or (lambda m: None)
+        self.progress_every_mb = progress_every_mb or 100
+        self._buf = b""
+        self._buf_pos = 0
+        self._next_progress_mb = self.progress_every_mb
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return False
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            chunks = []
+            while True:
+                c = self.read(self.FETCH_CHUNK)
+                if not c:
+                    break
+                chunks.append(c)
+            return b"".join(chunks)
+        out = bytearray()
+        while size > 0 and self.pos < self.total:
+            if self._buf_pos >= len(self._buf):
+                to_fetch = min(self.FETCH_CHUNK, self.total - self.pos)
+                self._buf = self.reader._fetch_range(self.pos, to_fetch)
+                self._buf_pos = 0
+                cur_mb = self.pos // (1024 * 1024)
+                if cur_mb >= self._next_progress_mb:
+                    pct = self.pos / self.total * 100
+                    self.log(
+                        f"  scannen... {pct:.0f}% "
+                        f"({cur_mb}/{self.total // (1024*1024)} MB)"
+                    )
+                    self._next_progress_mb = cur_mb + self.progress_every_mb
+            take = min(size, len(self._buf) - self._buf_pos)
+            out += self._buf[self._buf_pos : self._buf_pos + take]
+            self._buf_pos += take
+            self.pos += take
+            size -= take
+        return bytes(out)
 
 
 # ===========================
@@ -267,13 +299,19 @@ def find_release_for_date(date_obj, session, log_func):
 # HISTORISCHE DATA OPHALEN
 # ===========================
 def hex_to_tar_paths(hex_codes):
+    """Map hex -> list of acceptable paths inside the tar. adsb.lol used
+    .json.gz historically but ships plain .json in current releases, so
+    we accept both."""
     paths = {}
     for hex_code in hex_codes:
         h = hex_code.lower().strip()
         if len(h) < 2 or not re.fullmatch(r"[0-9a-f]+", h):
             continue
         subdir = h[-2:]
-        paths[h] = f"traces/{subdir}/trace_full_{h}.json.gz"
+        paths[h] = [
+            f"traces/{subdir}/trace_full_{h}.json",
+            f"traces/{subdir}/trace_full_{h}.json.gz",
+        ]
     return paths
 
 
@@ -283,19 +321,26 @@ def fetch_day(date_obj, hex_codes, cache_dir, log_func, cancel_event=None):
     day_dir.mkdir(parents=True, exist_ok=True)
 
     paths_map = hex_to_tar_paths(hex_codes)
-    reverse_map = {v: k for k, v in paths_map.items()}
+    reverse_map = {}
+    for hex_code, path_list in paths_map.items():
+        for p in path_list:
+            reverse_map[p] = hex_code
 
     needed_paths = set()
     cached = {}
-    for hex_code, tar_path in paths_map.items():
-        local_file = day_dir / f"{hex_code}.json.gz"
+    for hex_code in paths_map:
+        local_plain = day_dir / f"{hex_code}.json"
+        local_gz = day_dir / f"{hex_code}.json.gz"
         local_marker = day_dir / f"{hex_code}.missing"
-        if local_file.exists():
-            cached[hex_code] = local_file
+        if local_plain.exists():
+            cached[hex_code] = local_plain
+        elif local_gz.exists():
+            cached[hex_code] = local_gz
         elif local_marker.exists():
             cached[hex_code] = None
         else:
-            needed_paths.add(tar_path)
+            for p in paths_map[hex_code]:
+                needed_paths.add(p)
 
     if not needed_paths:
         log_func(f"  [{date_str}] al compleet in cache - overgeslagen")
@@ -316,32 +361,35 @@ def fetch_day(date_obj, hex_codes, cache_dir, log_func, cancel_event=None):
         reader._resolve_sizes()
         log_func(f"  totale grootte: {reader.total_size // (1024*1024)} MB")
         log_func(f"  scannen naar {len(needed_paths)} vliegtuigen...")
-        found = reader.find_files(needed_paths, log_progress_every=50*1024*1024,
+        found = reader.find_files(needed_paths, log_progress_every=200*1024*1024,
                                   cancel_event=cancel_event)
     except Exception as e:
         log_func(f"  [{date_str}] FOUT tijdens scannen: {e}")
         return cached
 
-    for tar_path in needed_paths:
-        hex_code = reverse_map[tar_path]
-        if tar_path not in found:
+    # Per hex: was at least one of its candidate paths found?
+    hexes_found = {reverse_map[p] for p in found}
+    for hex_code in paths_map:
+        if hex_code in cached:
+            continue  # already handled (cache hit or .missing marker)
+        if hex_code not in hexes_found:
             (day_dir / f"{hex_code}.missing").touch()
             cached[hex_code] = None
             log_func(f"  - {hex_code}: niet aanwezig in deze dag")
 
-    for tar_path, (offset, size) in found.items():
+    for tar_path, data in found.items():
         if cancel_event and cancel_event.is_set():
             log_func("  geannuleerd")
             return cached
         hex_code = reverse_map[tar_path]
         try:
-            data = reader.fetch_file(offset, size)
-            local_file = day_dir / f"{hex_code}.json.gz"
+            ext = ".json.gz" if tar_path.endswith(".json.gz") else ".json"
+            local_file = day_dir / f"{hex_code}{ext}"
             local_file.write_bytes(data)
             cached[hex_code] = local_file
-            log_func(f"  + {hex_code}: opgeslagen ({size:,} bytes)")
+            log_func(f"  + {hex_code}: opgeslagen ({len(data):,} bytes)")
         except Exception as e:
-            log_func(f"  ! {hex_code}: download fout: {e}")
+            log_func(f"  ! {hex_code}: opslaan fout: {e}")
 
     return cached
 
@@ -350,9 +398,16 @@ def fetch_day(date_obj, hex_codes, cache_dir, log_func, cancel_event=None):
 # TRACE PARSER
 # ===========================
 def parse_trace_file(json_gz_path, hex_code, date_obj):
+    # Sniff for gzip magic bytes; fall through to plain JSON if not gzipped.
     try:
-        with gzip.open(json_gz_path, "rt", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(json_gz_path, "rb") as f:
+            magic = f.read(2)
+        if magic == b"\x1f\x8b":
+            with gzip.open(json_gz_path, "rt", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            with open(json_gz_path, "rt", encoding="utf-8") as f:
+                data = json.load(f)
     except Exception:
         return None, []
 
@@ -535,7 +590,9 @@ def build_excel(cache_dir, hex_codes, excel_path, log_func):
         except ValueError:
             continue
         for hex_code in hex_codes:
-            file_path = day_dir / f"{hex_code}.json.gz"
+            file_path = day_dir / f"{hex_code}.json"
+            if not file_path.exists():
+                file_path = day_dir / f"{hex_code}.json.gz"
             if not file_path.exists():
                 continue
             meta, rows = parse_trace_file(file_path, hex_code, date_obj)
@@ -717,37 +774,50 @@ def diagnose_one_day(date_obj, hex_codes, log_func, cancel_event=None):
 
     target_map = {}
     for h in hex_codes:
-        target_map[f"traces/{h[-2:]}/trace_full_{h}.json.gz"] = ("haifa", h)
+        for ext in (".json", ".json.gz"):
+            target_map[f"traces/{h[-2:]}/trace_full_{h}{ext}"] = ("haifa", h)
     for h in CONTROL_HEXES:
-        target_map[f"traces/{h[-2:]}/trace_full_{h}.json.gz"] = ("control", h)
+        for ext in (".json", ".json.gz"):
+            target_map[f"traces/{h[-2:]}/trace_full_{h}{ext}"] = ("control", h)
 
     reader = MultiPartTarReader(urls, session=session, log_func=log_func)
     reader.part_sizes = sizes
     reader.total_size = total
     observed = set()
+    samples = []
     try:
         found = reader.find_files(target_map.keys(),
-                                  log_progress_every=100*1024*1024,
+                                  log_progress_every=200*1024*1024,
                                   cancel_event=cancel_event,
-                                  observed_subdirs=observed)
+                                  observed_subdirs=observed,
+                                  sample_names=samples)
     except Exception as e:
         log_func(f"FOUT tijdens scan: {e}")
         return
 
     log_func(f"Tar-subdirs bezocht: {len(observed)} (steekproef: "
              f"{sorted(observed)[:15]})")
+    if samples:
+        log_func("Eerste bestanden in tar:")
+        for s in samples[:10]:
+            log_func(f"    {s}")
     expected = sorted({h[-2:] for h in list(hex_codes) + CONTROL_HEXES})
     missing_dirs = [d for d in expected if d not in observed]
     if missing_dirs:
         log_func(f"WAARSCHUWING: subdirs niet gezien: {missing_dirs}")
 
-    haifa_found, ctrl_found = [], []
+    haifa_found, ctrl_found = set(), set()
     for path, (tag, h) in target_map.items():
         if path in found:
-            log_func(f"  + {tag:7s} {h}: GEVONDEN ({found[path][1]:,} bytes)")
-            (haifa_found if tag == "haifa" else ctrl_found).append(h)
-        else:
-            log_func(f"  - {tag:7s} {h}: ontbreekt")
+            (haifa_found if tag == "haifa" else ctrl_found).add(h)
+    for h in hex_codes:
+        marker = "+" if h in haifa_found else "-"
+        log_func(f"  {marker} haifa   {h}: "
+                 f"{'GEVONDEN' if h in haifa_found else 'ontbreekt'}")
+    for h in CONTROL_HEXES:
+        marker = "+" if h in ctrl_found else "-"
+        log_func(f"  {marker} control {h}: "
+                 f"{'GEVONDEN' if h in ctrl_found else 'ontbreekt'}")
 
     log_func("Oordeel:")
     if not haifa_found and not ctrl_found:
