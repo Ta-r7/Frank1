@@ -360,7 +360,8 @@ def fetch_day(date_obj, hex_codes, cache_dir, log_func, cancel_event=None):
     try:
         reader._resolve_sizes()
         log_func(f"  totale grootte: {reader.total_size // (1024*1024)} MB")
-        log_func(f"  scannen naar {len(needed_paths)} vliegtuigen...")
+        to_fetch = len([h for h in paths_map if h not in cached])
+        log_func(f"  scannen naar {to_fetch} vliegtuig(en)...")
         found = reader.find_files(needed_paths, log_progress_every=200*1024*1024,
                                   cancel_event=cancel_event)
     except Exception as e:
@@ -563,6 +564,8 @@ def _close_flight(f):
         "hex": f["hex"], "registration": f["registration"], "date": f["date"],
         "departure_utc": f["departure_utc"], "arrival_utc": f["arrival_utc"],
         "duration_min": round(duration, 1), "callsign": f["callsign"],
+        "departure_lat": f["_dep_lat"], "departure_lon": f["_dep_lon"],
+        "arrival_lat": f["_arr_lat"], "arrival_lon": f["_arr_lon"],
         "departure_airport": nearest_airport(f["_dep_lat"], f["_dep_lon"]),
         "arrival_airport": nearest_airport(f["_arr_lat"], f["_arr_lon"]),
         "max_alt_ft": int(f["max_alt_ft"] or 0),
@@ -620,6 +623,8 @@ def build_excel(cache_dir, hex_codes, excel_path, log_func):
     ws_f.title = "Vluchten"
     flight_headers = ["hex", "registration", "date", "departure_utc",
                       "arrival_utc", "duration_min", "callsign",
+                      "departure_lat", "departure_lon",
+                      "arrival_lat", "arrival_lon",
                       "departure_airport", "arrival_airport",
                       "max_alt_ft", "distance_km", "n_positions"]
     ws_f.append(flight_headers)
@@ -1201,7 +1206,11 @@ class AirHaifaTracker(tk.Tk):
         for item in self.live_tree.get_children():
             self.live_tree.delete(item)
 
-        active_hexes = {ac["hex"].lower(): ac for ac in data.get("ac", [])}
+        active_hexes = {}
+        for ac in data.get("ac", []):
+            h = (ac.get("hex") or "").lower()
+            if h:
+                active_hexes[h] = ac
 
         for hex_code in self.hex_codes:
             ac = active_hexes.get(hex_code.lower())
@@ -1214,20 +1223,22 @@ class AirHaifaTracker(tk.Tk):
                     alt_str = "ground"
                 elif lat is None or lon is None:
                     status = "Transponder aan, geen GPS"
-                    alt_str = str(alt) if alt else ""
+                    alt_str = str(alt) if alt not in (None, "") else ""
                 else:
                     status = "In de lucht"
-                    alt_str = str(alt) if alt else ""
+                    alt_str = str(alt) if alt not in (None, "") else ""
+                seen = ac.get("seen")
+                seen_str = f"{seen:.0f}s geleden" if isinstance(seen, (int, float)) else ""
                 values = (
-                    ac.get("hex", "").upper(),
-                    ac.get("r", ""),
-                    ac.get("flight", "").strip(),
+                    (ac.get("hex") or "").upper(),
+                    ac.get("r") or "",
+                    (ac.get("flight") or "").strip(),
                     status,
                     alt_str,
-                    ac.get("gs", ""),
-                    f"{lat:.4f}" if lat is not None else "",
-                    f"{lon:.4f}" if lon is not None else "",
-                    f"{ac.get('seen', 0):.0f}s geleden",
+                    ac.get("gs") if ac.get("gs") is not None else "",
+                    f"{lat:.4f}" if isinstance(lat, (int, float)) else "",
+                    f"{lon:.4f}" if isinstance(lon, (int, float)) else "",
+                    seen_str,
                 )
             else:
                 values = (hex_code.upper(), "", "", "Geen signaal",
